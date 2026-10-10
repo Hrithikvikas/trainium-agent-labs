@@ -1,0 +1,213 @@
+#!/bin/bash
+set -euxo pipefail
+
+cd /tmp
+git clone -b fast-dit https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-ti2v-5b.git
+cd wan2-ti2v-5b
+
+# New SDK 2.31 DLC image does NOT auto-activate a venv -> `uv pip install`
+# errors with "No virtual environment found". Target the SAME interpreter
+# python3 uses (where torch-neuronx already lives) via --python.
+UVPY="$(command -v python3)"
+echo "uv target interpreter: $UVPY"
+
+# ─── Install deps ─────────────────────────────────────────────
+sed -i '/flash_attn/d' wan_requirements.txt
+sed -i '/torchaudio/d' wan_requirements.txt
+# SDK 2.31 image ships numpy 2.5.1; the SDK's own NKI kernels (e.g.
+# nki_..._set_rng_state_gpsimd fired at init_process_group) use np.long,
+# re-added as an alias only in numpy>=2.0. The old `numpy<2` pin downgrades
+# to 1.26.4 (np.long removed in 1.24) -> "module 'numpy' has no attribute
+# 'long'" neuronx-cc exit 70. Strip the pin so the image's numpy 2.x stays.
+sed -i '/numpy/d' wan_requirements.txt
+uv pip install --python "$UVPY" -r wan_requirements.txt
+uv pip install --python "$UVPY" "setuptools<81"
+uv pip install --python "$UVPY" git+https://github.com/pytorch/vision.git@v0.25.0 --no-deps --no-cache --no-build-isolation
+
+# SDK 2.31 DLC ships a python3 built WITHOUT the _lzma stdlib extension.
+# torchvision eagerly imports datasets/utils.py -> `import lzma`, which
+# crashes the whole `import torchvision` chain at import time. torchvision.io
+# (all we actually use) never opens .xz files, so replace lzma with a stub
+# namespace that exposes .open (raises only if actually called) so import
+# succeeds.
+"$UVPY" - <<'PY'
+import importlib.util as u, pathlib
+loc = u.find_spec('torchvision').submodule_search_locations[0]
+p = pathlib.Path(loc) / 'datasets' / 'utils.py'
+s = p.read_text()
+if '_no_lzma' not in s:
+    stub = (
+        'try:\n'
+        '    import lzma\n'
+        'except ImportError:\n'
+        '    import types as _t\n'
+        '    def _no_lzma(*a, **k):\n'
+        '        raise RuntimeError("lzma unavailable in this Python build")\n'
+        '    lzma = _t.SimpleNamespace(open=_no_lzma, LZMAFile=_no_lzma)\n'
+    )
+    s = s.replace('import lzma\n', stub, 1)
+    p.write_text(s)
+    print('Patched torchvision datasets/utils.py: lzma replaced with stub')
+else:
+    print('torchvision datasets/utils.py already patched')
+PY
+
+# einops preinstalled on the old concourse image, absent from the SDK 2.31
+# native-pytorch image and not in wan_requirements.txt -> add it explicitly.
+uv pip install --python "$UVPY" imageio imageio-ffmpeg einops
+
+# ─── Model caching (S3-backed PVC tar pattern) ───────────────
+MODEL_TAR="/var/mdl/wan2_2_ti2v/Wan2.2-TI2V-5B.tar"
+MODEL_LOCAL="/tmp/Wan2.2-TI2V-5B"
+
+if [[ -f "$MODEL_TAR" ]]; then
+  echo "Copying model tar from S3 cache..."
+  cp "$MODEL_TAR" /tmp/Wan2.2-TI2V-5B.tar
+  echo "Extracting..."
+  tar xf /tmp/Wan2.2-TI2V-5B.tar -C /tmp/
+  rm -f /tmp/Wan2.2-TI2V-5B.tar
+else
+  echo "Downloading model from HuggingFace..."
+  python3 -c "
+from huggingface_hub import snapshot_download
+snapshot_download('Wan-AI/Wan2.2-TI2V-5B', local_dir='${MODEL_LOCAL}', local_dir_use_symlinks=False)
+"
+  echo "Creating tar archive for S3 cache..."
+  tar cf /tmp/Wan2.2-TI2V-5B.tar -C /tmp Wan2.2-TI2V-5B
+  mkdir -p "$(dirname $MODEL_TAR)"
+  cp /tmp/Wan2.2-TI2V-5B.tar "$MODEL_TAR"
+  rm -f /tmp/Wan2.2-TI2V-5B.tar
+  echo "Cached tar to S3!"
+fi
+echo "Model weights ready at $MODEL_LOCAL"
+
+# ========================================
+# Profiling: DISABLED to save HBM (~2.4GB per NC pair)
+# Re-enable after confirming model fits in memory:
+#   export NEURON_RT_INSPECT_ENABLE=1
+#   export NEURON_RT_INSPECT_OUTPUT_DIR=/tmp/neuron_profile
+#   export NEURON_RT_INSPECT_DEVICE_PROFILE=session
+# ========================================
+mkdir -p /tmp/neuron_profile
+echo "============================================"
+echo "  BENCHMARK: TP=${TP_DEGREE} DIT_FAST=${DIT_FAST} on s-lnc2-trn2"
+echo "  Profiling DISABLED (HBM constrained)"
+echo "============================================"
+
+# ─── Launch with torchrun (TP_DEGREE ranks, SP=1) ──────────
+export WAN_DIR="/tmp/wan2-ti2v-5b"
+export MODEL_PATH=/tmp/Wan2.2-TI2V-5B
+
+torchrun --nproc_per_node=${TP_DEGREE} --master_port=29500 \
+  /tmp/wan2-ti2v-5b/inference_neuron_ti2v.py 2>&1 || true
+
+# ========================================
+# Collect outputs
+# ========================================
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+RUN_DIR="/tmp/wan2_ti2v_run_${TIMESTAMP}"
+mkdir -p "$RUN_DIR"
+
+if [[ -f /tmp/wan2_ti2v_output.mp4 ]]; then
+  cp /tmp/wan2_ti2v_output.mp4 "$RUN_DIR/"
+fi
+
+# ========================================
+# Copy profile artifacts into run directory
+# ========================================
+PROFILE_DEST="$RUN_DIR/profiles"
+mkdir -p "$PROFILE_DEST"
+if [[ -d /tmp/neuron_profile && -n "$(ls -A /tmp/neuron_profile 2>/dev/null)" ]]; then
+  cp -r /tmp/neuron_profile/* "$PROFILE_DEST/"
+  echo "Profile artifacts saved to $PROFILE_DEST"
+fi
+
+# ========================================
+# Neuron Explorer: view + NEFF analysis
+# ========================================
+NTFF_DIR=$(find "$PROFILE_DEST" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | head -1)
+if [[ -n "$NTFF_DIR" ]]; then
+  echo ""
+  echo "============================================"
+  echo "  NEURON EXPLORER ANALYSIS"
+  echo "============================================"
+
+  echo "=== neuron-explorer view (summary-text) ==="
+  neuron-explorer view -d "$NTFF_DIR" \
+    --output-format summary-text \
+    --ignore-dma-trace 2>&1 | tee "$RUN_DIR/neuron_explorer_summary.txt" || true
+
+  echo ""
+  echo "=== neuron-explorer view (JSON, skip DMA) ==="
+  neuron-explorer view -d "$NTFF_DIR" \
+    --output-format json \
+    --output-file "$RUN_DIR/neuron_explorer_profile.json" \
+    --ignore-dma-trace 2>&1 | tee "$RUN_DIR/neuron_explorer_view.log" || true
+
+  echo ""
+  echo "=== NEFF COUNT AND SIZE DISTRIBUTION ==="
+  NEFF_COUNT=$(find "$NTFF_DIR" -name '*.neff' | wc -l)
+  echo "Total NEFFs: $NEFF_COUNT"
+  find "$NTFF_DIR" -name '*.neff' -exec ls -l '{}' ';' | awk '{print $5}' | sort -n | awk '
+    BEGIN { count=0; sum=0 }
+    { sizes[count++]=$1; sum+=$1 }
+    END {
+      if (count == 0) { print "No NEFFs found"; exit }
+      printf "Total size: %.2f MB\n", sum/1024/1024
+      printf "Min: %d bytes\n", sizes[0]
+      printf "Max: %d bytes (%.2f MB)\n", sizes[count-1], sizes[count-1]/1024/1024
+      printf "Median: %d bytes\n", sizes[int(count/2)]
+      printf "Mean: %.0f bytes\n", sum/count
+      printf "\nSize buckets:\n"
+      small=0; med=0; large=0; xlarge=0
+      for(i=0;i<count;i++) {
+        if(sizes[i]<10000) small++
+        else if(sizes[i]<100000) med++
+        else if(sizes[i]<1000000) large++
+        else xlarge++
+      }
+      printf "  <10KB  (tiny):   %d\n", small
+      printf "  10-100KB (small): %d\n", med
+      printf "  100KB-1MB (med):  %d\n", large
+      printf "  >1MB  (large):    %d\n", xlarge
+    }'
+
+  echo ""
+  echo "=== Top 15 LARGEST NEFFs ==="
+  find "$NTFF_DIR" -name '*.neff' -exec ls -lhS '{}' ';' | sort -k5 -h -r | head -15
+
+  echo ""
+  echo "=== Top 15 SMALLEST NEFFs ==="
+  find "$NTFF_DIR" -name '*.neff' -exec ls -lhS '{}' ';' | sort -k5 -h | head -15
+else
+  echo "WARNING: No profile directory found for neuron-explorer"
+fi
+
+# ========================================
+# ARCHIVE: Copy to S3 persistent storage
+# ========================================
+ARCHIVE_DIR="/var/mdl/wan2_2_ti2v/runs/${TIMESTAMP}"
+echo ""
+echo "============================================"
+echo "  ARCHIVING to S3: $ARCHIVE_DIR"
+echo "============================================"
+mkdir -p "$ARCHIVE_DIR"
+cp "$RUN_DIR/wan2_ti2v_output.mp4" "$ARCHIVE_DIR/" 2>/dev/null || true
+cp "$RUN_DIR/neuron_explorer_summary.txt" "$ARCHIVE_DIR/" 2>/dev/null || true
+cp "$RUN_DIR/neuron_explorer_profile.json" "$ARCHIVE_DIR/" 2>/dev/null || true
+cp "$RUN_DIR/neuron_explorer_view.log" "$ARCHIVE_DIR/" 2>/dev/null || true
+cp -r "$PROFILE_DEST" "$ARCHIVE_DIR/profiles" 2>/dev/null || true
+echo "Archive complete!"
+ls -la "$ARCHIVE_DIR/" 2>/dev/null || true
+
+echo "═══════════════════════════════════════════"
+echo "  Done! TP=${TP_DEGREE} benchmark complete"
+echo "═══════════════════════════════════════════"
+
+# Keep the pod alive so outputs can be pulled with kubectl cp (no S3 here):
+#   kubectl cp <pod>:/tmp/wan2_ti2v_output.mp4 ./wan2_ti2v_output.mp4
+# KEEP_ALIVE_SECONDS=0 exits immediately.
+if [[ "${KEEP_ALIVE_SECONDS:-0}" != "0" ]]; then
+  echo "Keeping pod alive for ${KEEP_ALIVE_SECONDS}s; video at /tmp/wan2_ti2v_output.mp4"
+  sleep "${KEEP_ALIVE_SECONDS}"
+fi
