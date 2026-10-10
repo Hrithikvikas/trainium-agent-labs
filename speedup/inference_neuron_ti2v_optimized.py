@@ -11,6 +11,7 @@ Optimizations:
   5. Latent sharpening       — SHARPEN_ENABLED, SHARPEN_FACTOR, SHARPEN_START_FRAC
   6. Temporal consistency    — TEMPORAL_ENABLED, TEMPORAL_ALPHA, TEMPORAL_START_FRAC
   7. Early-exit interpolation — EARLY_EXIT_ENABLED, EARLY_EXIT_SKIP_LAST_N
+  8. CFG cutoff              — CFG_CUTOFF_ENABLED, CFG_CUTOFF_FRAC
 
 Also saves:
   - Latent tensor after denoising (for MSE comparison)
@@ -28,6 +29,32 @@ import json
 
 import torch
 import torch.distributed as dist
+
+def _neuron_sync():
+    """Force all pending NeuronCore ops to complete before returning.
+
+    Trainium (torch-neuronx) uses lazy/async execution — model() returns
+    immediately after enqueueing work. Without an explicit sync, time.time()
+    measures enqueue latency, not actual compute. Calling .cpu() on a device
+    tensor also forces a sync, but relying on that is fragile; this helper
+    makes the intent explicit.
+
+    Falls back to xm.mark_step() if available (XLA path), otherwise
+    torch.neuron.synchronize() (Neuron SDK ≥ 2.x), otherwise a no-op
+    (the .cpu() calls in the scheduler step still provide an implicit sync).
+    """
+    try:
+        import torch_xla.core.xla_model as xm
+        xm.mark_step()
+        return
+    except (ImportError, RuntimeError):
+        pass
+    try:
+        torch.neuron.synchronize()
+        return
+    except (AttributeError, RuntimeError):
+        pass
+    # Implicit sync via .cpu() in the caller's data flow is the fallback
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
@@ -87,6 +114,10 @@ TEMPORAL_START_FRAC = float(os.environ.get("TEMPORAL_START_FRAC", "0.33"))
 EARLY_EXIT_ENABLED = os.environ.get("EARLY_EXIT_ENABLED", "0") == "1"
 EARLY_EXIT_SKIP_LAST_N = int(os.environ.get("EARLY_EXIT_SKIP_LAST_N", "1"))
 
+# CFG cutoff — skip unconditional pass after first N% of steps
+CFG_CUTOFF_ENABLED = os.environ.get("CFG_CUTOFF_ENABLED", "0") == "1"
+CFG_CUTOFF_FRAC = float(os.environ.get("CFG_CUTOFF_FRAC", "0.5"))
+
 # Output
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/tmp/wan2_experiments")
 EXPERIMENT_NAME = os.environ.get("EXPERIMENT_NAME", "default")
@@ -114,6 +145,8 @@ def get_config_dict():
         "temporal_start_frac": TEMPORAL_START_FRAC,
         "early_exit_enabled": EARLY_EXIT_ENABLED,
         "early_exit_skip_last_n": EARLY_EXIT_SKIP_LAST_N,
+        "cfg_cutoff_enabled": CFG_CUTOFF_ENABLED,
+        "cfg_cutoff_frac": CFG_CUTOFF_FRAC,
         "experiment_name": EXPERIMENT_NAME,
     }
 
@@ -236,6 +269,7 @@ def main():
         logger.info(f"  Sharpening:      {'ON (factor={}, start={})'.format(SHARPEN_FACTOR, SHARPEN_START_FRAC) if SHARPEN_ENABLED else 'OFF'}")
         logger.info(f"  Temporal:        {'ON (alpha={}, start={})'.format(TEMPORAL_ALPHA, TEMPORAL_START_FRAC) if TEMPORAL_ENABLED else 'OFF'}")
         logger.info(f"  Early exit:      {'ON (skip last {})'.format(EARLY_EXIT_SKIP_LAST_N) if EARLY_EXIT_ENABLED else 'OFF'}")
+        logger.info(f"  CFG cutoff:      {'ON (frac={}, skip uncond after step {}/{})'.format(CFG_CUTOFF_FRAC, int(NUM_STEPS * CFG_CUTOFF_FRAC), NUM_STEPS) if CFG_CUTOFF_ENABLED else 'OFF'}")
         logger.info("=" * 70)
 
     # ── Import Wan modules ──
@@ -445,6 +479,7 @@ def main():
         step_times = []
         step_types = []  # 'full', 'cached', 'interpolated'
 
+        _neuron_sync()  # flush any pending device work before timing
         run_start = time.time()
         denoise_start = time.time()
 
@@ -502,10 +537,21 @@ def main():
             timestep = temp_ts.unsqueeze(0)
 
             noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0]
-            noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0]
 
-            guide_scale = config.sample_guide_scale
-            noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
+            # ─── CFG CUTOFF: skip unconditional pass after early steps ───
+            cfg_cutoff_step = int(len(timesteps) * CFG_CUTOFF_FRAC)
+            if CFG_CUTOFF_ENABLED and step_idx >= cfg_cutoff_step:
+                # Late steps refine detail — CFG guidance adds diminishing value.
+                # Use conditional prediction directly, saving one full DiT pass (~4.4s).
+                noise_pred = noise_pred_cond
+                step_type = 'cfg_cutoff'
+                if rank == 0:
+                    logger.info(f"  Step {step_idx}: CFG CUTOFF (cond-only, skipped uncond pass)")
+            else:
+                noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0]
+                guide_scale = config.sample_guide_scale
+                noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
+                step_type = 'full'
 
             # ─── POINT A: CFG rescaling (before scheduler step) ───
             if CFG_RESCALE_ENABLED:
@@ -535,16 +581,18 @@ def main():
 
             latent_history.append(latent.cpu().clone())
             step_times.append(time.time() - step_start)
-            step_types.append('full')
+            step_types.append(step_type)
 
+        _neuron_sync()  # ensure all device work is done before stopping the timer
         denoise_time = time.time() - denoise_start
 
         if rank == 0:
             full_steps = step_types.count('full')
             cached_steps = step_types.count('cached')
             interp_steps = step_types.count('interpolated')
+            cutoff_steps = step_types.count('cfg_cutoff')
             logger.info(f"{run_label} denoising: {denoise_time:.1f}s "
-                        f"({full_steps} full, {cached_steps} cached, {interp_steps} interpolated)")
+                        f"({full_steps} full, {cutoff_steps} cfg_cutoff, {cached_steps} cached, {interp_steps} interpolated)")
 
         # ── Save latent for quality comparison ──
         if SAVE_LATENT and rank == 0:
